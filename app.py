@@ -44,7 +44,7 @@ def _promote_secrets_to_env():
 
 _promote_secrets_to_env()
 
-st.set_page_config(page_title="Macro Dashboard", layout="wide")
+st.set_page_config(page_title="Macro Dashboard", layout="centered")
 
 # Leave room at the bottom of the page so the fixed news ticker (added at
 # the end of the script) never covers the last row of charts.
@@ -498,7 +498,7 @@ with launch_col1:
     if st.button("🔥 Correlation Heatmap", width="stretch"):
         heatmap_dialog()
 with launch_col2:
-    if st.button("🤖 Ask AI", width="stretch"):
+    if st.button("✨ Ask AI", width="stretch"):
         ai_chart_dialog()
 
 tab_labels = list(TAB_CONFIG.keys())

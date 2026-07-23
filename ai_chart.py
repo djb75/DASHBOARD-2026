@@ -8,30 +8,48 @@ the dashboard's own data, so the result can be shown as a chart.
 Docs: https://console.groq.com/docs/api-reference#chat-create
 Free API key: https://console.groq.com/keys
 
-This is a proof of concept, not a hardened multi-tenant sandbox: the
-restricted builtins + thread timeout stop obviously bad code (file access,
-network, infinite loops that raise) but a determined adversarial prompt
-could still burn CPU in a background thread that outlives the timeout,
-since Python can't forcibly kill a thread. Fine for a single local user
-poking at their own dashboard; not something to expose publicly as-is.
+This is a proof of concept, not a hardened multi-tenant sandbox. Two layers
+of defense: a static AST check rejects dunder attribute/name access before
+anything runs (closing the classic `().__class__.__bases__[0]
+.__subclasses__()` trick of reaching subprocess.Popen or similar without
+ever importing anything — restricted builtins/imports alone don't stop
+this, since every Python object exposes its class/bases/subclasses
+regardless of what names are in scope), and actual execution happens in a
+separate subprocess (ai_chart_worker.py), not a thread, specifically so a
+runaway or adversarial snippet can be genuinely killed on timeout (verified:
+an actual infinite loop leaves no lingering process afterward) and
+best-effort memory-limited via a POSIX rlimit — confirmed working in
+principle but confirmed NON-functional on macOS specifically (a real
+XNU/kernel limitation, not a bug here; see ai_chart_worker.py), so the
+timeout is the only real backstop against a memory hog on macOS. Still not
+a real security boundary the way a container/gVisor/WASM sandbox is — fine
+for a single local user poking at their own dashboard, not
+something to expose publicly without further hardening.
 """
 
 from __future__ import annotations
 
+import ast
 import builtins
-import concurrent.futures
 import datetime
 import itertools
 import math
 import os
 import re
 import statistics
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 import requests
+
+_BASE_DIR = Path(__file__).resolve().parent
 
 _API_URL = "https://api.groq.com/openai/v1/chat/completions"
 _ENV_FILE = ".env"
@@ -160,12 +178,19 @@ Every available series_id (id | name | category | source):
 
 Rules:
 - Output ONLY raw Python code. No explanations, no markdown, no code fences.
-- Use pandas as pd, numpy as np, plotly.graph_objects as go, plotly.express as px.
-- df is already provided in scope — do not redefine or reload it.
+- df, pd (pandas), np (numpy), go (plotly.graph_objects), and px (plotly.express)
+  are already provided in scope — do not import them, and do not redefine or reload df.
+- The ONLY modules available at all, if you import anything, are: {", ".join(sorted(_ALLOWED_IMPORTS))}.
+  Nothing else is installed in this environment — no matplotlib, seaborn, scipy, sklearn,
+  statsmodels, requests, os, sys, or anything not in that list. Using px.scatter's
+  `trendline="ols"` will fail here since it needs statsmodels, which isn't available.
+- If the request genuinely cannot be done with only those modules, do not guess, invent
+  an import, or silently produce a wrong/empty chart. Instead set `fig = None` and set
+  `error_message = "<one short sentence explaining why not>"`.
 - Filter/reshape df as needed (e.g. pivot by series_id) to answer the request.
 - Assign the final chart to a variable named `fig` (a plotly Figure).
 - Only use series_id values from the catalog above — never invent one.
-- Do not read/write files, use the network, or import anything.
+- Do not read or write files, or use the network.
 """
 
 
@@ -210,28 +235,112 @@ def generate_chart_code(user_prompt: str, df: pd.DataFrame, api_key: str) -> str
 # Sandboxed execution
 # ---------------------------------------------------------------------------
 
-def _exec_code(code: str, df: pd.DataFrame) -> go.Figure:
-    sandbox_globals = {"__builtins__": _SAFE_BUILTINS}
-    sandbox_locals = {"df": df.copy(), "pd": pd, "np": np, "go": go, "px": px}
-    exec(compile(code, "<ai_chart>", "exec"), sandbox_globals, sandbox_locals)  # noqa: S102
+def build_sandbox_namespace(df: pd.DataFrame) -> dict:
+    """The restricted exec() namespace: builtins/imports allow-list + df/pd/np/go/px.
 
-    fig = sandbox_locals.get("fig")
-    if not isinstance(fig, go.Figure):
-        raise RuntimeError("The generated code didn't produce a `fig` variable that's a Plotly figure.")
-    return fig
+    Used as BOTH globals and locals when executing generated code (by
+    ai_chart_worker.py, in its own subprocess) — exec() with two separate
+    dicts is a classic trap: any def/lambda the generated code writes (e.g.
+    df["value"].apply(lambda v: np.log(v)), extremely common in pandas
+    code) gets its __globals__ fixed to the globals dict only, so names
+    that exist solely in a separate locals dict (np, pd, go, px, df)
+    vanish inside it with a NameError. One shared dict avoids that split.
+    """
+    return {
+        "__builtins__": _SAFE_BUILTINS,
+        "df": df.copy(),
+        "pd": pd,
+        "np": np,
+        "go": go,
+        "px": px,
+    }
+
+
+def _is_dunder(name: str) -> bool:
+    return name.startswith("__") and name.endswith("__")
+
+
+def check_code_safety(code: str) -> None:
+    """Static pre-check, run before the code ever executes (in-process, so
+    it can reject bad code without even paying for a subprocess spawn).
+
+    Blocks the classic sandbox-escape trick of reaching dangerous objects
+    via dunder introspection — e.g. `().__class__.__bases__[0]
+    .__subclasses__()` to find subprocess.Popen and get arbitrary process
+    execution, without ever calling `import` at all. Restricted builtins
+    and a restricted `__import__` don't stop this: every Python object
+    exposes its class/bases/subclasses via dunder attributes regardless of
+    what names happen to be in scope, so this has to be caught by
+    inspecting the code itself, not by restricting the runtime namespace.
+
+    Raises RuntimeError with a clear message if the code looks unsafe.
+    """
+    try:
+        tree = ast.parse(code, mode="exec")
+    except SyntaxError as exc:
+        raise RuntimeError(f"SyntaxError: {exc}") from exc
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and _is_dunder(node.attr):
+            raise RuntimeError(
+                f"Generated code accesses `.{node.attr}`, which looks like sandbox-escape "
+                f"introspection (e.g. reaching __class__/__subclasses__) rather than normal "
+                f"pandas/plotly usage, so it's blocked."
+            )
+        if isinstance(node, ast.Name) and _is_dunder(node.id):
+            raise RuntimeError(f"Generated code references `{node.id}` directly, which isn't allowed.")
 
 
 def run_chart_code(code: str, df: pd.DataFrame) -> tuple[go.Figure | None, str | None]:
-    """Run generated code in a restricted namespace with a wall-clock timeout.
+    """Run generated code in a separate, resource-limited subprocess.
+
+    A subprocess (not a thread) is used specifically because it can be
+    forcibly killed on timeout — Python threads cannot be killed once
+    started, so a thread-based approach would leave a runaway/adversarial
+    snippet burning CPU in the background indefinitely even after "giving
+    up" on it from the UI's perspective. The subprocess also gets its own
+    POSIX memory rlimit (see ai_chart_worker.py) so a huge-allocation
+    attempt can't take down the main Streamlit process — that's only safe
+    to apply because it's a fully separate process, not a limit shared
+    with the app itself.
 
     Returns (fig, None) on success or (None, error_message) on failure.
     """
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(_exec_code, code, df)
+    try:
+        check_code_safety(code)
+    except RuntimeError as exc:
+        return None, str(exc)
+
+    worker_path = _BASE_DIR / "ai_chart_worker.py"
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        df_path = os.path.join(tmp_dir, "df.pkl")
+        code_path = os.path.join(tmp_dir, "code.py")
+        output_path = os.path.join(tmp_dir, "fig.json")
+
+        df.to_pickle(df_path)
+        with open(code_path, "w", encoding="utf-8") as fh:
+            fh.write(code)
+
         try:
-            fig = future.result(timeout=_EXEC_TIMEOUT_S)
-            return fig, None
-        except concurrent.futures.TimeoutError:
-            return None, f"Generated code took longer than {_EXEC_TIMEOUT_S}s and was abandoned."
-        except Exception as exc:  # noqa: BLE001 - surface any generated-code error to the user
-            return None, f"{type(exc).__name__}: {exc}"
+            result = subprocess.run(
+                [sys.executable, str(worker_path), df_path, code_path, output_path],
+                capture_output=True,
+                text=True,
+                timeout=_EXEC_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return None, f"Generated code took longer than {_EXEC_TIMEOUT_S}s and was killed."
+        except OSError as exc:
+            return None, f"Could not start the sandboxed worker process: {exc}"
+
+        if result.returncode != 0:
+            message = result.stderr.strip() or f"Worker process exited with code {result.returncode}."
+            return None, message
+
+        if not os.path.exists(output_path):
+            return None, "The generated code didn't produce a `fig` variable that's a Plotly figure."
+
+        with open(output_path, encoding="utf-8") as fh:
+            fig = pio.from_json(fh.read())
+        return fig, None

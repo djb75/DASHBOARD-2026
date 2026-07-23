@@ -88,8 +88,14 @@ def fetch_news(
     api_key: str,
     topics: str = NEWS_TOPICS,
     limit: int = NEWS_LIMIT,
+    time_from: "pd.Timestamp | None" = None,
 ) -> pd.DataFrame:
-    """Fetch the latest macro headlines, with retry/backoff.
+    """Fetch macro headlines, with retry/backoff.
+
+    If time_from is given, only headlines published after it are requested
+    (Alpha Vantage's own server-side filter) — this is what makes repeated
+    calls incremental instead of re-fetching the same ~50 latest items
+    (many of them reposts/re-indexes of stories already seen) every time.
 
     Returns a frame with columns (title, url, time_published, source,
     overall_sentiment_label, overall_sentiment_score, summary), newest
@@ -102,6 +108,8 @@ def fetch_news(
         "limit": str(limit),
         "apikey": api_key,
     }
+    if time_from is not None:
+        params["time_from"] = time_from.strftime("%Y%m%dT%H%M")
     last_exc: Exception | None = None
     attempts = len(_RETRY_DELAYS_S) + 1
 

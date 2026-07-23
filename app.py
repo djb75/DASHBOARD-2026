@@ -17,11 +17,15 @@ from news_data import load_news
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# label -> (fetch script, [output pkl files whose mtime defines "as of"])
+# label -> (fetch script, [output pkl files whose mtime defines "as of"], staleness threshold)
+# News gets a much longer threshold than Yahoo/FRED: Alpha Vantage's free
+# tier is tightly rate-limited and macro-news topics have low genuine
+# volume, so checking it every hour like the others just burns quota
+# re-requesting headlines that mostly haven't changed.
 DATA_SOURCES = {
-    "Yahoo Finance": ("main.py", ["history.pkl", "snapshot.pkl"]),
-    "FRED": ("fred_main.py", ["fred_history.pkl", "fred_snapshot.pkl"]),
-    "News": ("news_main.py", ["news.pkl"]),
+    "Yahoo Finance": ("main.py", ["history.pkl", "snapshot.pkl"], dt.timedelta(hours=1)),
+    "FRED": ("fred_main.py", ["fred_history.pkl", "fred_snapshot.pkl"], dt.timedelta(hours=1)),
+    "News": ("news_main.py", ["news.pkl"], dt.timedelta(hours=6)),
 }
 _REFRESH_TIMEOUT_S = 240
 _SECRET_ENV_KEYS = ("FRED_API_KEY", "ALPHAVANTAGE_API_KEY", "GROQ_API_KEY")
@@ -71,9 +75,6 @@ filtered = df[(df["date"].dt.date >= date_range[0]) & (df["date"].dt.date <= dat
 st.title("Global Macro Dashboard")
 
 
-_STALE_AFTER = dt.timedelta(hours=1)
-
-
 def _data_as_of(filenames):
     """Latest mtime across the given files, or None if none exist yet."""
     mtimes = [(BASE_DIR / f).stat().st_mtime for f in filenames if (BASE_DIR / f).exists()]
@@ -83,25 +84,31 @@ def _data_as_of(filenames):
 
 
 def _stale_sources() -> list[str]:
-    """Data sources with no fetch yet, or whose last fetch is over an hour old."""
+    """Data sources with no fetch yet, or whose last fetch is older than their own threshold."""
     now = dt.datetime.now()
     return [
         label
-        for label, (_, filenames) in DATA_SOURCES.items()
-        if (as_of := _data_as_of(filenames)) is None or (now - as_of) > _STALE_AFTER
+        for label, (_, filenames, stale_after) in DATA_SOURCES.items()
+        if (as_of := _data_as_of(filenames)) is None or (now - as_of) > stale_after
     ]
 
 
-def run_refresh():
+def run_refresh(labels=None):
     """Run each fetch script in turn, then clear caches and rerun the app.
+
+    labels: which DATA_SOURCES to refresh; None (the manual button) means
+    all of them. The auto-refresh-on-load path passes only the sources
+    that are actually stale, so News's longer threshold isn't defeated by
+    getting swept along every time Yahoo/FRED's shorter one trips.
 
     A failure in one source (e.g. a missing/rate-limited Alpha Vantage key)
     is reported but doesn't stop the others — each source's own "as of" stays
     at its last successful fetch either way.
     """
+    targets = {label: DATA_SOURCES[label] for label in (labels if labels is not None else DATA_SOURCES)}
     with st.status("Refreshing data...", expanded=True) as status:
         any_failed = False
-        for label, (script, _) in DATA_SOURCES.items():
+        for label, (script, _, _) in targets.items():
             st.write(f"Fetching {label}...")
             try:
                 result = subprocess.run(
@@ -138,7 +145,7 @@ def run_refresh():
 def render_as_of_bar():
     cols = st.columns([2, 2, 2, 1.3])
     for col, label in zip(cols, DATA_SOURCES):
-        _, filenames = DATA_SOURCES[label]
+        _, filenames, _ = DATA_SOURCES[label]
         as_of = _data_as_of(filenames)
         with col:
             if as_of:
@@ -151,16 +158,19 @@ def render_as_of_bar():
             run_refresh()
 
 
-# Auto-refresh once per session if any source's data is over an hour old —
-# session_state guards this so it fires on first load only, not on every
-# rerun a widget interaction triggers (run_refresh() itself always ends in
-# st.rerun(), so on a genuine refresh this run stops here regardless).
+# Auto-refresh once per session if any source's data is older than its own
+# threshold — session_state guards this so it fires on first load only, not
+# on every rerun a widget interaction triggers (run_refresh() itself always
+# ends in st.rerun(), so on a genuine refresh this run stops here anyway).
+# Only the stale sources are refreshed, not all three, so News's longer
+# threshold actually reduces its fetch frequency instead of being swept
+# along whenever Yahoo/FRED's shorter threshold trips.
 if "auto_refresh_done" not in st.session_state:
     st.session_state["auto_refresh_done"] = True
     stale = _stale_sources()
     if stale:
-        st.info(f"Data is over an hour old ({', '.join(stale)}) — refreshing automatically...")
-        run_refresh()
+        st.info(f"Data is stale ({', '.join(stale)}) — refreshing automatically...")
+        run_refresh(stale)
 
 render_as_of_bar()
 
@@ -562,7 +572,7 @@ def render_news_ticker(news_df):
         .news-ticker-track {{
             display: inline-block;
             white-space: nowrap;
-            animation: news-ticker-scroll 120s linear infinite;
+            animation: news-ticker-scroll 240s linear infinite;
         }}
         .news-ticker-bar:hover .news-ticker-track {{
             animation-play-state: paused;

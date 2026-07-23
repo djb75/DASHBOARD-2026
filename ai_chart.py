@@ -76,39 +76,41 @@ _SAFE_BUILTIN_NAMES = (
 )
 _SAFE_BUILTINS = {name: getattr(builtins, name) for name in _SAFE_BUILTIN_NAMES if hasattr(builtins, name)}
 
-# Modules the sandbox will hand back on `import X` — the exact objects this
-# module already has loaded, never a fresh disk/network import. Anything
-# else (os, sys, subprocess, socket, ...) is refused with a clear message.
-_ALLOWED_IMPORTS = {
-    "pandas": pd,
-    "numpy": np,
-    "plotly": __import__("plotly"),
-    "plotly.graph_objects": go,
-    "plotly.express": px,
-    "math": math,
-    "datetime": datetime,
-    "re": re,
-    "statistics": statistics,
-    "itertools": itertools,
+# Top-level packages the sandbox will import — gated by package, not by an
+# exact finite list of dotted paths. That distinction matters: numpy/pandas
+# lazily self-import private submodules the first time certain methods are
+# called (e.g. ndarray.mean() imports numpy._core._methods on first use),
+# and Python resolves __import__ via the CALLING frame's builtins — i.e.
+# whichever exec() namespace happens to be executing when that first call
+# fires, not the frame numpy's own code textually lives in. An exact-path
+# allowlist rejected those as if they were something the user's code tried
+# to reach, breaking ordinary methods like .mean()/.std()/.corr() outright.
+# None of this is a bigger trust boundary than before: pd/np/go/px are
+# handed over as the real, fully-loaded modules already, so every submodule
+# here was already reachable via plain attribute access (pd.io, np.linalg,
+# ...) with zero import needed — this just makes `import` syntax consistent
+# with that pre-existing access rather than blocking the statement while
+# the equivalent attribute access still works.
+_TRUSTED_TOP_LEVEL_PACKAGES = {
+    "pandas", "numpy", "plotly", "math", "datetime", "re", "statistics", "itertools",
 }
+_REAL_IMPORT = builtins.__import__  # captured before any sandbox ever overrides it
 
 
 def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
-    if name not in _ALLOWED_IMPORTS:
+    top_level = name.split(".")[0]
+    if top_level not in _TRUSTED_TOP_LEVEL_PACKAGES:
         raise ImportError(
             f"'{name}' isn't available in this sandbox. Only pandas, numpy, "
-            f"plotly (graph_objects/express), math, datetime, re, statistics, "
-            f"and itertools can be imported — pd/np/go/px are already in scope "
+            f"plotly, math, datetime, re, statistics, itertools (and their "
+            f"submodules) can be imported — pd/np/go/px are already in scope "
             f"under those names without needing an import at all."
         )
-    if not fromlist and "." in name:
-        # __import__'s contract: with no fromlist, return the TOP-level
-        # package and let the interpreter walk the remaining attributes
-        # itself (this is what "import plotly.graph_objects as go" needs —
-        # it wants plotly.graph_objects, reached via plotly's own attribute,
-        # not the go module handed back directly).
-        return _ALLOWED_IMPORTS[name.split(".")[0]]
-    return _ALLOWED_IMPORTS[name]
+    # Delegate the actual mechanics (submodules, fromlist, sys.modules
+    # caching, the whole "return top-level vs. leaf module" contract) to
+    # the real __import__ — we only gate WHICH top-level package is
+    # trusted, not how import resolution itself works.
+    return _REAL_IMPORT(name, globals, locals, fromlist, level)
 
 
 _SAFE_BUILTINS["__import__"] = _restricted_import
@@ -180,7 +182,7 @@ Rules:
 - Output ONLY raw Python code. No explanations, no markdown, no code fences.
 - df, pd (pandas), np (numpy), go (plotly.graph_objects), and px (plotly.express)
   are already provided in scope — do not import them, and do not redefine or reload df.
-- The ONLY modules available at all, if you import anything, are: {", ".join(sorted(_ALLOWED_IMPORTS))}.
+- The ONLY modules available at all, if you import anything, are: {", ".join(sorted(_TRUSTED_TOP_LEVEL_PACKAGES))}.
   Nothing else is installed in this environment — no matplotlib, seaborn, scipy, sklearn,
   statsmodels, requests, os, sys, or anything not in that list. Using px.scatter's
   `trendline="ols"` will fail here since it needs statsmodels, which isn't available.
@@ -189,7 +191,9 @@ Rules:
   `error_message = "<one short sentence explaining why not>"`.
 - Filter/reshape df as needed (e.g. pivot by series_id) to answer the request.
 - Assign the final chart to a variable named `fig` (a plotly Figure).
-- Only use series_id values from the catalog above — never invent one.
+- Only use series_id values from the catalog above — never invent one. If the user asks
+  for a ticker/series that isn't in the catalog, do not silently filter down to an empty
+  chart — set `fig = None` and `error_message = "<name> isn't in the available dataset"`.
 - Do not read or write files, or use the network.
 """
 

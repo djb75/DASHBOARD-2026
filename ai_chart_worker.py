@@ -30,12 +30,22 @@ back as the user-facing error.
 from __future__ import annotations
 
 import sys
+import warnings
 
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
 
 from ai_chart import build_sandbox_namespace
+
+# Generated code routinely hits numpy/pandas RuntimeWarnings (e.g. an empty
+# slice mean, or too few points for a correlation's degrees of freedom) even
+# when it goes on to raise a real exception right after. Python's default
+# warning handler writes those to stderr — the exact channel this worker
+# uses to hand the ONE meaningful error line back to the parent — so left
+# unsuppressed, the real error (e.g. "LinAlgError: ...") ends up buried under
+# a wall of unrelated warning noise in the user-facing message.
+warnings.filterwarnings("ignore")
 
 try:
     import resource  # POSIX only — not available on Windows
@@ -48,6 +58,11 @@ except ImportError:
 # RLIMIT_AS works (see module docstring — confirmed non-functional on macOS).
 _MAX_MEMORY_BYTES = 2_000_000_000
 
+# Attributes across the trace types our sandbox can realistically produce
+# (go/px cover Scatter, Bar, Heatmap, Candlestick, Pie, Histogram, Box, ...)
+# that actually hold plotted data, as opposed to styling/metadata fields.
+_TRACE_DATA_ATTRS = ("x", "y", "z", "values", "labels", "open", "high", "low", "close")
+
 
 def _apply_memory_limit() -> None:
     if resource is None:
@@ -56,6 +71,23 @@ def _apply_memory_limit() -> None:
         resource.setrlimit(resource.RLIMIT_AS, (_MAX_MEMORY_BYTES, _MAX_MEMORY_BYTES))
     except (ValueError, OSError):
         pass  # e.g. macOS — confirmed unenforceable there; timeout-based kill still applies
+
+
+def _figure_has_data(fig: go.Figure) -> bool:
+    """False for a technically-valid Figure with zero actual data points.
+
+    Catches the case where generated code filters df down to nothing (e.g.
+    a ticker/series that doesn't exist in this dataset) and then plots the
+    empty result directly — which raises no exception at all, just quietly
+    produces a blank chart. Whatever the model's code actually did to get
+    there, an empty chart is never a useful answer to show as if it worked.
+    """
+    for trace in fig.data:
+        for attr in _TRACE_DATA_ATTRS:
+            val = getattr(trace, attr, None)
+            if val is not None and len(val) > 0:
+                return True
+    return False
 
 
 def main() -> int:
@@ -76,6 +108,14 @@ def main() -> int:
             print(f"The AI couldn't build this chart: {error_message}", file=sys.stderr)
         else:
             print("The generated code didn't produce a `fig` variable that's a Plotly figure.", file=sys.stderr)
+        return 1
+
+    if not _figure_has_data(fig):
+        print(
+            "The chart has no data to show — check that the tickers/series you asked "
+            "for actually exist in this dataset.",
+            file=sys.stderr,
+        )
         return 1
 
     with open(output_path, "w", encoding="utf-8") as fh:

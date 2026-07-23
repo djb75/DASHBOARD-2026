@@ -71,12 +71,25 @@ filtered = df[(df["date"].dt.date >= date_range[0]) & (df["date"].dt.date <= dat
 st.title("Macro Dashboard")
 
 
+_STALE_AFTER = dt.timedelta(hours=1)
+
+
 def _data_as_of(filenames):
     """Latest mtime across the given files, or None if none exist yet."""
     mtimes = [(BASE_DIR / f).stat().st_mtime for f in filenames if (BASE_DIR / f).exists()]
     if not mtimes:
         return None
     return dt.datetime.fromtimestamp(max(mtimes))
+
+
+def _stale_sources() -> list[str]:
+    """Data sources with no fetch yet, or whose last fetch is over an hour old."""
+    now = dt.datetime.now()
+    return [
+        label
+        for label, (_, filenames) in DATA_SOURCES.items()
+        if (as_of := _data_as_of(filenames)) is None or (now - as_of) > _STALE_AFTER
+    ]
 
 
 def run_refresh():
@@ -137,6 +150,17 @@ def render_as_of_bar():
         if st.button("🔄 Refresh data", width="stretch"):
             run_refresh()
 
+
+# Auto-refresh once per session if any source's data is over an hour old —
+# session_state guards this so it fires on first load only, not on every
+# rerun a widget interaction triggers (run_refresh() itself always ends in
+# st.rerun(), so on a genuine refresh this run stops here regardless).
+if "auto_refresh_done" not in st.session_state:
+    st.session_state["auto_refresh_done"] = True
+    stale = _stale_sources()
+    if stale:
+        st.info(f"Data is over an hour old ({', '.join(stale)}) — refreshing automatically...")
+        run_refresh()
 
 render_as_of_bar()
 
@@ -442,7 +466,9 @@ def render_ai_chart_tab(data):
     code = st.session_state.get("ai_chart_code")
 
     if error:
-        st.error(error)
+        st.error("⚠️ The AI couldn't generate this chart. Try rephrasing your request.")
+        with st.expander("Show error details"):
+            st.code(error)
     if fig is not None:
         st.plotly_chart(fig, width="stretch")
     if code:
@@ -450,20 +476,36 @@ def render_ai_chart_tab(data):
             st.code(code, language="python")
 
 
-tab_labels = list(TAB_CONFIG.keys()) + ["Heatmap", "Ask AI"]
+@st.dialog("Correlation Heatmap", width="large", icon="🔥")
+def heatmap_dialog():
+    # Uses its own date-range picker rather than the sidebar range —
+    # correlation is computed over whatever window the user picks here.
+    render_heatmap_tab(df)
+
+
+@st.dialog("Ask AI", width="large", icon="🤖")
+def ai_chart_dialog():
+    # Uses the full unfiltered dataset — the AI picks its own range
+    # from the prompt rather than being constrained by the sidebar.
+    render_ai_chart_tab(df)
+
+
+# Pulled out of the tab bar — with 10 category tabs already, these two were
+# easy to miss scrolled off to the right. Popups keep them one click away
+# and impossible not to notice.
+launch_col1, launch_col2, _ = st.columns([1, 1, 3])
+with launch_col1:
+    if st.button("🔥 Correlation Heatmap", width="stretch"):
+        heatmap_dialog()
+with launch_col2:
+    if st.button("🤖 Ask AI", width="stretch"):
+        ai_chart_dialog()
+
+tab_labels = list(TAB_CONFIG.keys())
 tabs = st.tabs(tab_labels)
 for tab, label in zip(tabs, tab_labels):
     with tab:
-        if label == "Heatmap":
-            # Uses its own date-range picker rather than the sidebar range —
-            # correlation is computed over whatever window the user picks here.
-            render_heatmap_tab(df)
-        elif label == "Ask AI":
-            # Uses the full unfiltered dataset — the AI picks its own range
-            # from the prompt rather than being constrained by the sidebar.
-            render_ai_chart_tab(df)
-        else:
-            render_tab(filtered, TAB_CONFIG[label])
+        render_tab(filtered, TAB_CONFIG[label])
 
 
 _SENTIMENT_COLORS = {

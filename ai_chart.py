@@ -20,8 +20,12 @@ from __future__ import annotations
 
 import builtins
 import concurrent.futures
+import datetime
+import itertools
+import math
 import os
 import re
+import statistics
 
 import numpy as np
 import pandas as pd
@@ -38,9 +42,14 @@ _EXEC_TIMEOUT_S = 15
 
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL)
 
-# Builtins allow-list for the exec() sandbox — no __import__, open, exec,
-# eval, compile, input, or anything else that reaches outside pandas/numpy/
-# plotly manipulation of the dataframe already handed to it.
+# Builtins allow-list for the exec() sandbox — no open, exec, eval, compile,
+# input, or anything else that reaches outside pandas/numpy/plotly
+# manipulation of the dataframe already handed to it. __import__ is handled
+# separately below (a restricted version, not a plain removal) because
+# models routinely prepend "import pandas as pd" etc. to snippets despite
+# being told the modules are already in scope — removing __import__ entirely
+# turned that into a confusing "missing module" error instead of just
+# harmlessly re-binding a name we already trust.
 _SAFE_BUILTIN_NAMES = (
     "abs", "all", "any", "bool", "dict", "enumerate", "filter", "float",
     "int", "len", "list", "map", "max", "min", "range", "reversed", "round",
@@ -48,6 +57,43 @@ _SAFE_BUILTIN_NAMES = (
     "print",
 )
 _SAFE_BUILTINS = {name: getattr(builtins, name) for name in _SAFE_BUILTIN_NAMES if hasattr(builtins, name)}
+
+# Modules the sandbox will hand back on `import X` — the exact objects this
+# module already has loaded, never a fresh disk/network import. Anything
+# else (os, sys, subprocess, socket, ...) is refused with a clear message.
+_ALLOWED_IMPORTS = {
+    "pandas": pd,
+    "numpy": np,
+    "plotly": __import__("plotly"),
+    "plotly.graph_objects": go,
+    "plotly.express": px,
+    "math": math,
+    "datetime": datetime,
+    "re": re,
+    "statistics": statistics,
+    "itertools": itertools,
+}
+
+
+def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name not in _ALLOWED_IMPORTS:
+        raise ImportError(
+            f"'{name}' isn't available in this sandbox. Only pandas, numpy, "
+            f"plotly (graph_objects/express), math, datetime, re, statistics, "
+            f"and itertools can be imported — pd/np/go/px are already in scope "
+            f"under those names without needing an import at all."
+        )
+    if not fromlist and "." in name:
+        # __import__'s contract: with no fromlist, return the TOP-level
+        # package and let the interpreter walk the remaining attributes
+        # itself (this is what "import plotly.graph_objects as go" needs —
+        # it wants plotly.graph_objects, reached via plotly's own attribute,
+        # not the go module handed back directly).
+        return _ALLOWED_IMPORTS[name.split(".")[0]]
+    return _ALLOWED_IMPORTS[name]
+
+
+_SAFE_BUILTINS["__import__"] = _restricted_import
 
 
 # ---------------------------------------------------------------------------

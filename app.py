@@ -1,6 +1,6 @@
 import datetime as dt
 import html
-import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 
 from ai_chart import generate_chart_code, get_api_key as get_groq_api_key, run_chart_code
 from dashboard_data import TAB_CONFIG, load_data
@@ -23,6 +24,25 @@ DATA_SOURCES = {
     "News": ("news_main.py", ["news.pkl"]),
 }
 _REFRESH_TIMEOUT_S = 240
+_SECRET_ENV_KEYS = ("FRED_API_KEY", "ALPHAVANTAGE_API_KEY", "GROQ_API_KEY")
+
+
+def _promote_secrets_to_env():
+    """Hosted (e.g. Streamlit Community Cloud) API keys live in st.secrets,
+    not a local .env file. Copy them into os.environ so fred_fetch.py /
+    news_fetch.py / ai_chart.py — and the fetch scripts run as subprocesses
+    by the Refresh button, which only inherit real env vars, never
+    st.secrets — all keep working unchanged, on hosted or local alike.
+    """
+    try:
+        for key in _SECRET_ENV_KEYS:
+            if key not in os.environ and key in st.secrets:
+                os.environ[key] = st.secrets[key]
+    except StreamlitSecretNotFoundError:
+        pass  # local dev: no secrets.toml — .env already covers this via os.environ
+
+
+_promote_secrets_to_env()
 
 st.set_page_config(page_title="Macro Dashboard", layout="wide")
 
@@ -261,59 +281,55 @@ def render_tab(data, categories):
                 render_line_chart(series_data, row["name"], row["units"], key)
 
 
-def render_heatmap_grid(rows, trade_date):
-    n = len(rows)
-    n_cols = max(1, math.ceil(math.sqrt(n)))
-    n_rows = math.ceil(n / n_cols)
+def render_correlation_heatmap(returns, labels):
+    """returns: wide DataFrame indexed by date, one column of daily % returns per series_id."""
+    corr = returns.corr()
+    series_ids = corr.columns.tolist()
+    n = len(series_ids)
+    tick_labels = [labels[sid] for sid in series_ids]
 
-    z = np.full((n_rows, n_cols), np.nan)
-    text = np.full((n_rows, n_cols), "", dtype=object)
-    hover = np.full((n_rows, n_cols), "", dtype=object)
-
-    for i, row in enumerate(rows):
-        r, c = divmod(i, n_cols)
-        pct = row["pct"]
-        z[r, c] = pct if pd.notna(pct) else 0.0  # neutral color when no prior close to compare
-        pct_str = f"{pct:+.2f}%" if pd.notna(pct) else "n/a"
-        text[r, c] = f"{row['series_id']}<br>{pct_str}"
-        hover[r, c] = (
-            f"{row['name']}<br>{trade_date:%Y-%m-%d}"
-            f"<br>Close: {row['value']:.4f}<br>Change: {pct_str}"
-        )
-
-    max_abs = max(float(np.nanmax(np.abs(z))) if n else 0.0, 0.5)
+    z = corr.values
+    text = np.array([[f"{z[i, j]:.2f}" if pd.notna(z[i, j]) else "n/a" for j in range(n)] for i in range(n)])
+    hover = np.array(
+        [[f"{tick_labels[i]} vs {tick_labels[j]}<br>Correlation: {z[i, j]:.3f}"
+          if pd.notna(z[i, j]) else f"{tick_labels[i]} vs {tick_labels[j]}<br>Not enough overlapping data"
+          for j in range(n)] for i in range(n)]
+    )
 
     fig = go.Figure(
         go.Heatmap(
             z=z,
+            x=series_ids,
+            y=series_ids,
             text=text,
             texttemplate="%{text}",
-            textfont={"size": 12, "color": "white"},
+            textfont={"size": 11, "color": "white"},
             customdata=hover,
             hovertemplate="%{customdata}<extra></extra>",
-            colorscale=[[0, "#E74C3C"], [0.5, "#2A2E37"], [1, "#2ECC71"]],
+            colorscale=[[0, "#E74C3C"], [0.5, "#253f59"], [1, "#2ECC71"]],
             zmid=0,
-            zmin=-max_abs,
-            zmax=max_abs,
+            zmin=-1,
+            zmax=1,
             showscale=True,
-            colorbar=dict(title="% chg"),
-            xgap=4,
-            ygap=4,
+            colorbar=dict(title="corr"),
+            xgap=2,
+            ygap=2,
         )
     )
     fig.update_layout(
-        title=f"Daily change — {trade_date:%Y-%m-%d}",
-        height=120 * n_rows + 80,
+        title="Return correlation",
+        height=max(400, 60 * n),
         margin=dict(l=10, r=10, t=50, b=10),
-        xaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
-        yaxis=dict(showticklabels=False, showgrid=False, zeroline=False, autorange="reversed"),
+        xaxis=dict(showgrid=False, zeroline=False, tickangle=-45),
+        yaxis=dict(showgrid=False, zeroline=False, autorange="reversed"),
     )
     st.plotly_chart(fig, width="stretch")
 
 
 def render_heatmap_tab(data):
     # Scoped to Yahoo Finance instruments only — FRED series are economic
-    # releases, not traded tickers, so "trade date" doesn't apply to them.
+    # releases on their own irregular calendars, not daily-traded prices,
+    # so a return correlation isn't a like-for-like comparison there.
     yahoo_df = data[data["source"] == "Yahoo Finance"]
 
     instruments = yahoo_df[["series_id", "name"]].drop_duplicates().sort_values("name")
@@ -326,57 +342,65 @@ def render_heatmap_tab(data):
     )
 
     available_dates = sorted(yahoo_df["date"].dt.date.unique())
-    trade_date = st.date_input(
-        "Trade date",
-        value=available_dates[-1],
+    date_range = st.date_input(
+        "Date range for correlation",
+        value=(available_dates[0], available_dates[-1]),
         min_value=available_dates[0],
         max_value=available_dates[-1],
     )
 
     if not selected:
-        st.info("Select one or more tickers above to see the heatmap.")
+        st.info("Select two or more tickers above to see their return correlation.")
         return
 
-    if trade_date not in available_dates:
-        nearest = min(available_dates, key=lambda d: abs((d - trade_date).days))
+    if len(selected) < 2:
+        st.info("Select at least one more ticker — correlation needs two or more series.")
+        return
+
+    if not isinstance(date_range, tuple) or len(date_range) != 2:
+        st.info("Pick a start and end date to define the correlation window.")
+        return
+
+    start_date, end_date = date_range
+    if start_date > end_date:
+        st.warning("Start date is after end date — pick a valid range.")
+        return
+
+    window = yahoo_df[
+        yahoo_df["series_id"].isin(selected)
+        & (yahoo_df["date"].dt.date >= start_date)
+        & (yahoo_df["date"].dt.date <= end_date)
+    ]
+
+    if window.empty:
         st.warning(
-            f"No trading data available for {trade_date:%Y-%m-%d} — markets were "
-            f"likely closed that day (weekend or holiday). Nearest available "
-            f"trade date: {nearest:%Y-%m-%d}."
+            f"No trading data available for the selected tickers between "
+            f"{start_date:%Y-%m-%d} and {end_date:%Y-%m-%d}."
         )
         return
 
-    rows = []
-    missing = []
-    for sid in selected:
-        series = yahoo_df[yahoo_df["series_id"] == sid].sort_values("date").reset_index(drop=True)
-        day_idx = series.index[series["date"].dt.date == trade_date]
-        if len(day_idx) == 0:
-            missing.append(sid)
-            continue
-        pos = day_idx[0]
-        curr_value = series.loc[pos, "value"]
-        pct = float("nan")
-        if pos > 0:
-            prev_value = series.loc[pos - 1, "value"]
-            if pd.notna(prev_value) and prev_value != 0:
-                pct = (curr_value / prev_value - 1.0) * 100.0
-        rows.append(
-            {"series_id": sid, "name": labels[sid], "pct": pct, "value": curr_value}
-        )
+    wide = window.pivot_table(index="date", columns="series_id", values="value")
 
+    missing = [sid for sid in selected if sid not in wide.columns]
+    present = [sid for sid in selected if sid in wide.columns]
     if missing:
         missing_names = ", ".join(labels[m] for m in missing)
-        st.caption(
-            f"No data on {trade_date:%Y-%m-%d} for: {missing_names} "
-            f"(that market was likely closed on this date)."
-        )
+        st.caption(f"No data in this range for: {missing_names} — excluded from the correlation.")
 
-    if not rows:
-        st.warning(f"None of the selected tickers had data on {trade_date:%Y-%m-%d}.")
+    wide = wide[present]
+    if wide.shape[1] < 2:
+        st.warning("Not enough tickers with data in this range to compute a correlation.")
         return
 
-    render_heatmap_grid(rows, trade_date)
+    returns = wide.pct_change().dropna(how="all")
+    if returns.shape[0] < 2:
+        st.warning(
+            f"Not enough overlapping trading days between {start_date:%Y-%m-%d} and "
+            f"{end_date:%Y-%m-%d} to compute a correlation — pick a wider date range."
+        )
+        return
+
+    render_correlation_heatmap(returns, labels)
 
 
 def render_ai_chart_tab(data):
@@ -431,8 +455,8 @@ tabs = st.tabs(tab_labels)
 for tab, label in zip(tabs, tab_labels):
     with tab:
         if label == "Heatmap":
-            # Uses its own trade-date picker rather than the sidebar range —
-            # a heatmap is inherently a single-day snapshot, not a time series.
+            # Uses its own date-range picker rather than the sidebar range —
+            # correlation is computed over whatever window the user picks here.
             render_heatmap_tab(df)
         elif label == "Ask AI":
             # Uses the full unfiltered dataset — the AI picks its own range
@@ -486,8 +510,8 @@ def render_news_ticker(news_df):
             bottom: 0;
             left: 0;
             width: 100%;
-            background: #0E1117;
-            border-top: 1px solid #333;
+            background: #082741;
+            border-top: 1px solid #457b9d;
             padding: 8px 0;
             overflow: hidden;
             white-space: nowrap;
@@ -503,12 +527,12 @@ def render_news_ticker(news_df):
         }}
         .ticker-item {{
             display: inline-block;
-            color: #EEE;
+            color: #FFFFFF;
             font-size: 14px;
             margin-right: 48px;
         }}
         .ticker-item a {{
-            color: #EEE;
+            color: #FFFFFF;
             text-decoration: none;
         }}
         .ticker-item a:hover {{
@@ -522,7 +546,7 @@ def render_news_ticker(news_df):
             margin-right: 6px;
         }}
         .ticker-time {{
-            color: #888;
+            color: #9fb8cc;
             font-size: 12px;
         }}
         @keyframes news-ticker-scroll {{

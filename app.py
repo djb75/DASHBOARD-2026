@@ -44,7 +44,7 @@ def _promote_secrets_to_env():
 
 _promote_secrets_to_env()
 
-st.set_page_config(page_title="Macro Dashboard", layout="wide")
+st.set_page_config(page_title="Global Macro Dashboard", layout="wide")
 
 # Leave room at the bottom of the page so the fixed news ticker (added at
 # the end of the script) never covers the last row of charts.

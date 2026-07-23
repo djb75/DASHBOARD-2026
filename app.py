@@ -68,7 +68,7 @@ date_range = st.sidebar.slider(
 
 filtered = df[(df["date"].dt.date >= date_range[0]) & (df["date"].dt.date <= date_range[1])]
 
-st.title("Macro Dashboard")
+st.title("Global Macro Dashboard")
 
 
 _STALE_AFTER = dt.timedelta(hours=1)
